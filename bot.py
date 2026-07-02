@@ -385,6 +385,7 @@ async def license_cmd(
         use_external_emojis=True,
         mention_everyone=False,
         manage_threads=(license_type == 2),
+        create_threads=(license_type == 2),
     )
 
     try:
