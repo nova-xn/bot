@@ -1,0 +1,566 @@
+diff --git a/bot.py b/bot.py
+index 3e5fd8a..ff0a20e 100644
+--- a/bot.py
++++ b/bot.py
+@@ -8,6 +8,7 @@ Neway RP — Discord-бот модерации.
+     -license @user <1|2> <channel_id>— выдать лицензию участнику РП
+     -data    [запрос]                — база данных лицензий
+     -note    @user <текст>           — добавить/изменить заметку к пользователю
++    -wipe    @user confirm           — безвозвратно очистить историю лицензий пользователя
+     -del     <количество>            — удалить сообщения в канале
+     -delus   @user <количество>      — удалить сообщения пользователя по серверу
+ 
+@@ -18,7 +19,7 @@ import datetime
+ import re
+ 
+ import discord
+-from discord.ext import commands
++from discord.ext import commands, tasks
+ 
+ import config
+ import license_db
+@@ -83,6 +84,29 @@ async def globally_restrict_guild(ctx: commands.Context) -> bool:
+     return ctx.guild is not None and ctx.guild.id == config.GUILD_ID
+ 
+ 
++# ============================================================
++#  ГЛОБАЛЬНЫЙ ЧЕК: не выполнять одно и то же сообщение дважды
++# ============================================================
++#
++# Если Discord по какой-то причине доставит одно и то же событие
++# сообщения повторно (переподключение к gateway) — или если по ошибке
++# параллельно запущены два процесса бота с одним токеном — этот чек
++# гарантирует, что тело команды всё равно выполнится только один раз.
++# Проверка атомарна на уровне БД (см. license_db.claim_message), поэтому
++# защита работает даже между разными процессами, а не только внутри
++# одного.
++
++@bot.check
++async def globally_deduplicate_messages(ctx: commands.Context) -> bool:
++    try:
++        return license_db.claim_message(ctx.message.id)
++    except Exception as e:
++        # Если БД временно недоступна — не блокируем работу бота из-за
++        # этого чека, просто пропускаем защиту и логируем предупреждение.
++        print(f"[ПРЕДУПРЕЖДЕНИЕ] Не удалось проверить дубликат сообщения: {e}")
++        return True
++
++
+ # ============================================================
+ #  СОБЫТИЯ
+ # ============================================================
+@@ -94,6 +118,19 @@ async def on_ready():
+     for guild in bot.guilds:
+         if guild.id != config.GUILD_ID:
+             print(f"[ВНИМАНИЕ] Бот присутствует на чужом сервере: {guild.name} ({guild.id})")
++    if not cleanup_processed_messages_loop.is_running():
++        cleanup_processed_messages_loop.start()
++
++
++@tasks.loop(hours=6)
++async def cleanup_processed_messages_loop():
++    """Периодически чистит таблицу processed_messages от старых записей."""
++    try:
++        deleted = license_db.cleanup_processed_messages(older_than_hours=24)
++        if deleted:
++            print(f"[OK] Очищено {deleted} старых записей processed_messages.")
++    except Exception as e:
++        print(f"[ПРЕДУПРЕЖДЕНИЕ] Не удалось очистить processed_messages: {e}")
+ 
+ 
+ @bot.event
+@@ -339,6 +376,22 @@ async def license_cmd(
+         ))
+         return
+ 
++    # --- Проверка: на канал ещё не выдана другая активная лицензия ---
++    existing = license_db.get_active_license_by_channel(channel_id)
++    if existing is not None:
++        await ctx.send(embed=make_embed(
++            "⛔ Каналу уже назначена лицензия",
++            f"На канал {target_channel.mention} уже выдана активная лицензия "
++            f"`{existing['license_id']}` ({license_type_label(existing['license_type'])}) "
++            f"для <@{existing['discord_id']}>.\n\n"
++            f"Один канал не может одновременно обслуживать больше одной "
++            f"активной лицензии. Сначала отзовите текущую командой "
++            f"`{config.PREFIX}cancel <@{existing['discord_id']}> {existing['license_type']}`, "
++            f"либо укажите другой канал.",
++            config.COLOR_ERROR,
++        ))
++        return
++
+     # --- Выдача роли ---
+     role_id = license_role_id(license_type)
+     role = ctx.guild.get_role(role_id)
+@@ -410,13 +463,39 @@ async def license_cmd(
+         return
+ 
+     # --- Запись в БД ---
+-    lic_id = license_db.issue_license(
+-        license_type=license_type,
+-        discord_id=member.id,
+-        username=str(member),
+-        channel_id=channel_id,
+-        issued_by=ctx.author.id,
+-    )
++    try:
++        lic_id = license_db.issue_license(
++            license_type=license_type,
++            discord_id=member.id,
++            username=str(member),
++            channel_id=channel_id,
++            issued_by=ctx.author.id,
++        )
++    except license_db.ChannelAlreadyLicensedError as e:
++        # Кто-то успел выдать лицензию на этот канал буквально в последний
++        # момент (гонка между двумя одновременными вызовами команды) — база
++        # данных отклонила запись. Откатываем уже выданные роль и права,
++        # чтобы они не остались висеть без соответствующей записи в БД.
++        existing = e.existing
++        try:
++            await member.remove_roles(role, reason="Откат: канал уже занят другой лицензией")
++        except discord.HTTPException:
++            pass
++        try:
++            await target_channel.set_permissions(
++                member, overwrite=None,
++                reason="Откат: канал уже занят другой лицензией",
++            )
++        except discord.HTTPException:
++            pass
++        await ctx.send(embed=make_embed(
++            "⛔ Каналу уже назначена лицензия",
++            f"На канал {target_channel.mention} уже выдана активная лицензия "
++            f"`{existing['license_id']}` для <@{existing['discord_id']}>. "
++            f"Попробуйте выдать лицензию ещё раз, указав другой канал.",
++            config.COLOR_ERROR,
++        ))
++        return
+ 
+     label = license_type_label(license_type)
+ 
+@@ -745,6 +824,108 @@ async def note_cmd(ctx: commands.Context, member: discord.Member = None, *, text
+     ))
+ 
+ 
++# ============================================================
++#  КОМАНДА: -wipe @user confirm
++#  Безвозвратно удаляет всю историю лицензий пользователя из БД.
++# ============================================================
++
++@bot.command(name="wipe")
++async def wipe_cmd(
++    ctx: commands.Context,
++    member: discord.Member = None,
++    confirm: str = None,
++):
++    """Полностью и безвозвратно удаляет историю лицензий пользователя из базы."""
++
++    if not ctx.author.guild_permissions.administrator:
++        await ctx.send(embed=make_embed(
++            "⛔ Недостаточно прав",
++            f"Команда `{config.PREFIX}wipe` доступна только участникам "
++            f"с правом **Администратор** на сервере.",
++            config.COLOR_ERROR,
++        ))
++        return
++
++    if member is None:
++        await ctx.send(embed=make_embed(
++            "❌ Неверный синтаксис",
++            f"Использование: `{config.PREFIX}wipe @пользователь confirm`\n"
++            f"Сначала вызовите команду без `confirm` — бот покажет, что будет удалено.",
++            config.COLOR_ERROR,
++        ))
++        return
++
++    history = license_db.search_by_discord_id(member.id)
++    if not history:
++        await ctx.send(embed=make_embed(
++            "ℹ️ История пуста",
++            f"У {member.mention} нет ни одной записи в истории лицензий — удалять нечего.",
++            config.COLOR_INFO,
++        ))
++        return
++
++    active = [r for r in history if not r["revoked"]]
++    revoked = [r for r in history if r["revoked"]]
++
++    # --- Без "confirm" на конце — только показываем предупреждение ---
++    if confirm is None or confirm.lower() != "confirm":
++        warning = (
++            f"У {member.mention} найдено **{len(history)}** записей в истории лицензий:\n"
++            f"• Активных: **{len(active)}**\n"
++            f"• Отозванных: **{len(revoked)}**\n\n"
++        )
++        if active:
++            warning += (
++                "⚠️ Среди них есть **активные** лицензии. Очистка истории "
++                "**не снимает** роль и права на канале — если нужно лишить "
++                f"доступа, сначала отзовите их через `{config.PREFIX}cancel`.\n\n"
++            )
++        warning += (
++            "Это действие **необратимо** и полностью сотрёт записи из базы "
++            "(в отличие от `-cancel`, который только помечает их отозванными).\n\n"
++            f"Чтобы подтвердить, повторите команду с `confirm` на конце:\n"
++            f"```\n{config.PREFIX}wipe {member.id} confirm\n```"
++        )
++        await ctx.send(embed=make_embed(
++            "⚠️ Подтвердите очистку истории",
++            warning,
++            config.COLOR_REVOKE,
++        ))
++        return
++
++    # --- Подтверждено — удаляем ---
++    deleted = license_db.clear_history(member.id)
++
++    await ctx.send(embed=make_embed(
++        "🧾 История лицензий очищена",
++        f"Пользователь: {member.mention} (`{member.id}`)\n"
++        f"Удалено записей: **{deleted}**",
++        config.COLOR_SUCCESS,
++    ))
++
++    log_channel = bot.get_channel(config.CANCEL_LOG_CHANNEL_ID)
++    if log_channel:
++        log_embed = discord.Embed(
++            title="🧾 Очищена история лицензий",
++            color=config.COLOR_REVOKE,
++            timestamp=datetime.datetime.now(datetime.timezone.utc),
++        )
++        log_embed.set_thumbnail(url=member.display_avatar.url)
++        log_embed.add_field(
++            name="👤 Пользователь",
++            value=f"{member.mention} (`{member}`)\nID: `{member.id}`",
++            inline=False,
++        )
++        log_embed.add_field(
++            name="🛠 Выполнил",
++            value=f"{ctx.author.mention} (`{ctx.author}`)\nID: `{ctx.author.id}`",
++            inline=False,
++        )
++        log_embed.add_field(name="🗑 Удалено записей", value=str(deleted), inline=True)
++        log_embed.set_footer(text=config.FOOTER_TEXT)
++        await log_channel.send(embed=log_embed)
++
++
+ # ============================================================
+ #  ОБЩАЯ ПРОВЕРКА ПРАВ ДЛЯ -del / -delus
+ # ============================================================
+@@ -1003,9 +1184,11 @@ async def delus_messages(ctx: commands.Context, member: discord.Member = None, a
+ # ============================================================
+ 
+ # Структура: каждая запись — один «блок» помощи.
+-# required_roles=None  → команда доступна всем участникам сервера.
+-# required_roles=<set> → блок показывается только если у вызывающего есть
+-#                        хотя бы одна из перечисленных ролей.
++# required_roles=None    → команда доступна всем участникам сервера.
++# required_roles=<set>   → блок показывается только если у вызывающего есть
++#                          хотя бы одна из перечисленных ролей.
++# required_roles="ADMIN" → блок показывается только участникам с правом
++#                          Администратор на сервере (не зависит от ролей).
+ 
+ _HELP_BLOCKS = [
+     # ── -report ──────────────────────────────────────────────────────────────
+@@ -1041,7 +1224,9 @@ _HELP_BLOCKS = [
+             "**Ограничения:**\n"
+             "• Канал должен быть **форумом** и находиться в специальной категории лицензий.\n"
+             "  Если указать текстовый канал или канал вне этой категории — команда будет отклонена.\n"
+-            "• Одному участнику можно выдать несколько лицензий одного типа на разные каналы.\n\n"
++            "• Одному участнику можно выдать несколько лицензий одного типа на разные каналы.\n"
++            "• На **один канал** одновременно может действовать только **одна** активная "
++            "лицензия — выдать вторую на тот же канал, пока первая не отозвана, нельзя.\n\n"
+             "**Примеры:**\n"
+             "```\n"
+             "-license @username 1 1234567890123456789\n"
+@@ -1114,6 +1299,32 @@ _HELP_BLOCKS = [
+             "```"
+         ),
+     },
++    # ── -wipe ────────────────────────────────────────────────────────
++    {
++        "required_roles": "ADMIN",
++        "emoji": "🧾",
++        "name": "-wipe @пользователь confirm",
++        "description": (
++            "Полностью и **безвозвратно** удаляет всю историю лицензий "
++            "пользователя из базы данных (и активные, и уже отозванные записи).\n\n"
++            "**Доступна только участникам с правом Администратор** на сервере "
++            "(не зависит от конкретных ролей).\n\n"
++            "В отличие от `-cancel`, который только помечает лицензии отозванными "
++            "и хранит их в истории, эта команда стирает записи насовсем — "
++            "используйте её только для очистки ошибочных/тестовых записей.\n\n"
++            "**Как работает:**\n"
++            "• Вызов **без** `confirm` — покажет, сколько записей найдено "
++            "(активных/отозванных), но ничего не удалит.\n"
++            "• Вызов **с** `confirm` в конце — подтверждает и выполняет удаление.\n\n"
++            "⚠️ Команда не снимает роль и права на канале — если у пользователя "
++            "есть активные лицензии, сначала отзовите их через `-cancel`.\n\n"
++            "**Примеры:**\n"
++            "```\n"
++            "-wipe @username\n"
++            "-wipe @username confirm\n"
++            "```"
++        ),
++    },
+     # ── -del ─────────────────────────────────────────────────────────────────
+     {
+         "required_roles": config.DELETE_ALLOWED_ROLE_IDS,
+@@ -1151,18 +1362,22 @@ _HELP_BLOCKS = [
+ ]
+ 
+ 
++def _help_block_visible(block: dict, ctx: commands.Context) -> bool:
++    required = block["required_roles"]
++    if required is None:
++        return True
++    if required == "ADMIN":
++        return ctx.author.guild_permissions.administrator
++    author_role_ids = {role.id for role in ctx.author.roles}
++    return bool(author_role_ids & required)
++
++
+ @bot.command(name="help")
+ async def help_cmd(ctx: commands.Context):
+     """Показывает список доступных команд с подробным описанием."""
+ 
+-    author_role_ids = {role.id for role in ctx.author.roles}
+-
+     # Фильтруем блоки: показываем только те, к которым у пользователя есть доступ
+-    visible_blocks = [
+-        block for block in _HELP_BLOCKS
+-        if block["required_roles"] is None
+-        or bool(author_role_ids & block["required_roles"])
+-    ]
++    visible_blocks = [block for block in _HELP_BLOCKS if _help_block_visible(block, ctx)]
+ 
+     if not visible_blocks:
+         await ctx.send(embed=make_embed(
+diff --git a/config.py b/config.py
+index 04e3420..de1cf0f 100644
+--- a/config.py
++++ b/config.py
+@@ -95,6 +95,11 @@ DATA_ALLOWED_ROLE_IDS = {
+     1520321736648949935,
+ }
+ 
++# Примечание: команда -wipe (безвозвратная очистка истории лицензий)
++# не использует список ролей — она доступна только участникам с правом
++# Администратор на сервере (проверяется напрямую через
++# ctx.author.guild_permissions.administrator в bot.py).
++
+ # Роль, выдаваемая при лицензии типа 1 (Участник РП) → RPP-XXXXXXX
+ LICENSE_1_ROLE_ID = 1520321736631914679
+ 
+diff --git a/license_db.py b/license_db.py
+index dcb1472..02772c1 100644
+--- a/license_db.py
++++ b/license_db.py
+@@ -28,9 +28,10 @@
+ import contextlib
+ import os
+ import threading
+-from datetime import datetime, timezone
++from datetime import datetime, timedelta, timezone
+ 
+ import psycopg2
++import psycopg2.errors
+ import psycopg2.extras
+ 
+ try:
+@@ -45,6 +46,24 @@ DATABASE_URL = os.getenv("DATABASE_URL")
+ _lock = threading.Lock()
+ 
+ 
++class ChannelAlreadyLicensedError(Exception):
++    """
++    На канал уже выдана активная (не отозванная) лицензия — второй
++    активной лицензии на тот же канал одновременно быть не может.
++
++    Атрибут `existing` содержит словарь с данными уже действующей
++    лицензии (тот же формат, что возвращают функции поиска), чтобы
++    вызывающий код мог показать, кому и когда она была выдана.
++    """
++
++    def __init__(self, existing: dict):
++        self.existing = existing
++        super().__init__(
++            f"Channel {existing.get('channel_id')} already has an active "
++            f"license ({existing.get('license_id')})"
++        )
++
++
+ @contextlib.contextmanager
+ def _connect():
+     """
+@@ -102,6 +121,30 @@ def init_db() -> None:
+                 updated_at  TEXT
+             );
+         """)
++        # Частичный уникальный индекс: у одного канала не может быть
++        # больше одной АКТИВНОЙ (revoked = 0) лицензии одновременно.
++        # Отозванные (revoked = 1) записи в индекс не входят, поэтому
++        # историю по каналу хранить можно сколько угодно — ограничение
++        # действует только на текущую, ещё не отозванную лицензию.
++        # Это защищает от дублей даже если команда -license по какой-то
++        # причине (двойное нажатие, второй экземпляр бота и т.п.)
++        # обработается больше одного раза — Postgres просто отклонит
++        # вторую попытку на уровне базы.
++        cur.execute("""
++            CREATE UNIQUE INDEX IF NOT EXISTS idx_licenses_channel_active
++                ON licenses (channel_id)
++                WHERE revoked = 0;
++        """)
++        # Таблица для защиты от повторной обработки одного и того же
++        # сообщения Discord (см. claim_message ниже) — на случай двойной
++        # доставки события от Discord или двух одновременно запущенных
++        # процессов бота с одним токеном.
++        cur.execute("""
++            CREATE TABLE IF NOT EXISTS processed_messages (
++                message_id    BIGINT PRIMARY KEY,
++                processed_at  TEXT   NOT NULL
++            );
++        """)
+ 
+ 
+ # ────────────────────────────────────────────────────────────
+@@ -143,17 +186,76 @@ def issue_license(
+     """
+     Записывает новую лицензию в БД.
+     Возвращает сгенерированный license_id (например, «RPP-0000001»).
++
++    Поднимает ChannelAlreadyLicensedError, если на указанный канал уже
++    выдана активная лицензия (проверяется на уровне базы данных через
++    уникальный индекс — см. init_db — поэтому защита работает даже при
++    гонке между двумя одновременными вызовами).
++    """
++    try:
++        with _lock, _connect() as conn:
++            lic_id = _next_license_id(conn, license_type)
++            cur = conn.cursor()
++            cur.execute(
++                """INSERT INTO licenses
++                   (license_id, license_type, discord_id, username, channel_id, issued_by, issued_at)
++                   VALUES (%s, %s, %s, %s, %s, %s, %s)""",
++                (lic_id, license_type, discord_id, username, channel_id, issued_by, _now_iso()),
++            )
++            return lic_id
++    except psycopg2.errors.UniqueViolation:
++        existing = get_active_license_by_channel(channel_id)
++        if existing is not None:
++            raise ChannelAlreadyLicensedError(existing) from None
++        raise
++
++
++# ────────────────────────────────────────────────────────────
++#  ЗАЩИТА ОТ ДВОЙНОЙ ОБРАБОТКИ ОДНОГО СООБЩЕНИЯ
++# ────────────────────────────────────────────────────────────
++
++def claim_message(message_id: int) -> bool:
++    """
++    Атомарно "занимает" ID сообщения Discord для обработки команды.
++
++    Возвращает True — если это сообщение обрабатывается впервые, команду
++    можно выполнять.
++    Возвращает False — если это сообщение уже было занято раньше (например,
++    Discord доставил событие повторно, либо параллельно работают два
++    процесса бота с одним токеном) — в этом случае команду нужно
++    проигнорировать, чтобы не выполнить её второй раз.
++
++    Работает на уровне PostgreSQL (INSERT ... ON CONFLICT DO NOTHING),
++    поэтому гарантия "выполнится только один раз" действует даже между
++    разными процессами, не только внутри одного.
+     """
+     with _lock, _connect() as conn:
+-        lic_id = _next_license_id(conn, license_type)
+         cur = conn.cursor()
+         cur.execute(
+-            """INSERT INTO licenses
+-               (license_id, license_type, discord_id, username, channel_id, issued_by, issued_at)
+-               VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+-            (lic_id, license_type, discord_id, username, channel_id, issued_by, _now_iso()),
++            """INSERT INTO processed_messages (message_id, processed_at)
++               VALUES (%s, %s)
++               ON CONFLICT (message_id) DO NOTHING
++               RETURNING message_id""",
++            (message_id, _now_iso()),
+         )
+-        return lic_id
++        return cur.fetchone() is not None
++
++
++def cleanup_processed_messages(older_than_hours: int = 24) -> int:
++    """
++    Удаляет из processed_messages записи старше указанного количества
++    часов — таблица нужна только чтобы поймать повторную доставку
++    сообщения в течение короткого времени, хранить её вечно незачем.
++    Возвращает количество удалённых строк.
++    """
++    with _lock, _connect() as conn:
++        cur = conn.cursor()
++        cur.execute(
++            """DELETE FROM processed_messages
++               WHERE processed_at < %s""",
++            ((datetime.now(timezone.utc) - timedelta(hours=older_than_hours)).isoformat(),),
++        )
++        return cur.rowcount
+ 
+ 
+ # ────────────────────────────────────────────────────────────
+@@ -235,6 +337,21 @@ def search_by_username(username: str) -> list[dict]:
+         return [dict(r) for r in cur.fetchall()]
+ 
+ 
++def get_active_license_by_channel(channel_id: int) -> dict | None:
++    """
++    Возвращает активную (не отозванную) лицензию, привязанную к каналу,
++    либо None, если канал сейчас свободен.
++    """
++    with _connect() as conn:
++        cur = conn.cursor()
++        cur.execute(
++            "SELECT * FROM licenses WHERE channel_id = %s AND revoked = 0 LIMIT 1",
++            (channel_id,),
++        )
++        row = cur.fetchone()
++        return dict(row) if row else None
++
++
+ def get_active_licenses(discord_id: int, license_type: int) -> list[dict]:
+     """Только активные (не отозванные) лицензии конкретного типа."""
+     with _connect() as conn:
+@@ -247,6 +364,33 @@ def get_active_licenses(discord_id: int, license_type: int) -> list[dict]:
+         return [dict(r) for r in cur.fetchall()]
+ 
+ 
++# ────────────────────────────────────────────────────────────
++#  ОЧИСТКА ИСТОРИИ ЛИЦЕНЗИЙ
++# ────────────────────────────────────────────────────────────
++
++def clear_history(discord_id: int) -> int:
++    """
++    Полностью удаляет ВСЮ историю лицензий пользователя (активные и
++    отозванные записи). Действие необратимо — в отличие от revoke_licenses,
++    которая только помечает лицензии отозванными, эта функция стирает
++    строки из таблицы licenses насовсем.
++
++    Возвращает количество удалённых записей (0, если истории не было).
++
++    Обратите внимание: сама по себе эта функция НЕ снимает роли и права
++    на каналах в Discord — если у пользователя есть активные лицензии,
++    их нужно сначала отозвать через revoke_licenses (или -cancel в боте),
++    иначе роль/доступ у него останутся, а следов в базе не будет.
++    """
++    with _lock, _connect() as conn:
++        cur = conn.cursor()
++        cur.execute(
++            "DELETE FROM licenses WHERE discord_id = %s",
++            (discord_id,),
++        )
++        return cur.rowcount
++
++
+ # ────────────────────────────────────────────────────────────
+ #  ЗАМЕТКИ
+ # ────────────────────────────────────────────────────────────
