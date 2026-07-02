@@ -386,7 +386,6 @@ async def license_cmd(
         mention_everyone=False,
         manage_messages=(license_type == 2),
         manage_threads=(license_type == 2),
-        create_posts=(license_type == 2),
     )
 
     try:
