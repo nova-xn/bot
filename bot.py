@@ -384,6 +384,7 @@ async def license_cmd(
         add_reactions=True,
         use_external_emojis=True,
         mention_everyone=False,
+        manage_messages=(license_type == 2),
         manage_threads=(license_type == 2),
     )
 
